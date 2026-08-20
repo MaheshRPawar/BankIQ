@@ -1,0 +1,16 @@
+# trained model artifacts (regenerated automatically on first run)
+banking_chatbot_model.pkl
+banking_chatbot_vectorizer.pkl
+banking_chatbot_explained.py
+
+# gradio runtime files
+.gradio/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os junk
+.DS_Store
