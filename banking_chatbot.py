@@ -11,17 +11,19 @@ Run with: python banking_chatbot.py
 import os
 import random
 import re
+import tempfile
 
+import gradio as gr
 import joblib
 import nltk
 import pandas as pd
+from gtts import gTTS
+from gtts.tts import gTTSError
 from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.naive_bayes import MultinomialNB
-
-import gradio as gr
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -77,7 +79,46 @@ ESCALATION_NOTICE = (
     f"please call our 24x7 helpline at {TOLL_FREE_NUMBER}."
 )
 
+# A question is "vague" if it's just a bare topic mention - a couple of
+# words with no verb or question word attached, like "saving account" or
+# "loan" on their own - rather than an actual question about that topic.
+# We ask the user to be specific instead of guessing what they meant.
+VAGUE_QUERY_MAX_WORDS = 3
+
+ACTION_WORDS = {
+    "how", "what", "why", "when", "where", "who", "which", "can", "could", "do", "does",
+    "is", "are", "will", "would", "should", "need", "want", "please", "help", "explain",
+    "show", "tell", "get", "check", "open", "close", "block", "unblock", "apply", "update",
+    "change", "reset", "transfer", "pay", "deposit", "withdraw", "activate", "deactivate",
+    "cancel", "register", "link", "download", "print", "report", "request", "add", "remove",
+    "increase", "decrease", "convert", "know", "find", "locate", "contact", "call", "verify",
+    "confirm", "issue", "complain", "complaint", "dispute", "lost", "stolen", "missing",
+    "wrong", "error", "problem", "fail", "failed", "not", "working", "decommission", "email",
+    "occur", "occurred", "unauthorized", "delay", "delayed", "pending", "reject", "rejected",
+    "decline", "declined", "send", "receive", "make", "set", "setup", "enable", "disable",
+    "renew", "upgrade", "downgrade", "order", "track", "file", "submit", "provide", "give",
+    "procedure", "process", "steps", "way", "ways", "method", "eligibility", "eligible",
+}
+
+VAGUE_QUERY_MESSAGE_TEMPLATE = (
+    'I\'m not sure what you\'d like to know about "{query}". '
+    "Could you specify your question a bit more — for example, what you'd "
+    "like to do or find out about it?"
+)
+
 BOT_NAME = "BankIQ"
+
+# Indian-accent English via Google's TTS endpoint (tld="co.in" is what
+# selects the accent - gTTS otherwise defaults to a US-accented voice).
+TTS_LANGUAGE = "en"
+TTS_ACCENT_TLD = "co.in"
+
+# Emoji/symbols read awkwardly (or get skipped oddly) by TTS engines, so
+# they're stripped before handing text to gTTS. This does not affect the
+# text shown in the chat window, only the audio version of it.
+EMOJI_PATTERN = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\U0001F1E6-\U0001F1FF]+"
+)
 
 nltk.download("stopwords", quiet=True)
 STOPWORDS = set(stopwords.words("english"))
@@ -108,6 +149,20 @@ def detect_small_talk(text):
             if re.search(rf"\b{re.escape(trigger)}\b", normalized):
                 return category
     return None
+
+
+def is_vague_query(text):
+    """
+    True if this looks like a bare topic mention ("saving account", "loan",
+    "kyc") rather than an actual question about that topic. A handful of
+    words with no verb or question word attached gives no real signal of
+    what the user actually wants to know, so instead of guessing which of
+    several possible questions they meant, we ask them to be specific.
+    """
+    tokens = re.findall(r"[a-zA-Z']+", text.lower())
+    if not tokens or len(tokens) > VAGUE_QUERY_MAX_WORDS:
+        return False
+    return not any(token in ACTION_WORDS for token in tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +233,10 @@ def get_response(question, model, vectorizer, df, priority_lookup, threshold=CON
         response = random.choice(options) if len(options) > 1 else options[0]
         return response, small_talk_category, 1.0
 
+    if is_vague_query(question):
+        clarification = VAGUE_QUERY_MESSAGE_TEMPLATE.format(query=question.strip())
+        return clarification, None, 0.0
+
     cleaned = clean_text(question)
     vector = vectorizer.transform([cleaned])
 
@@ -209,43 +268,110 @@ def get_response(question, model, vectorizer, df, priority_lookup, threshold=CON
 
 
 # ---------------------------------------------------------------------------
+# Text-to-speech (read aloud) - opt-in only, triggered by a button
+# ---------------------------------------------------------------------------
+
+def synthesize_speech(text):
+    """
+    Converts text to an Indian-accent English MP3 using gTTS and returns
+    the file path, or None if speech generation failed (e.g. no internet).
+    Requires an internet connection - gTTS calls Google's TTS service, it
+    does not run offline.
+    """
+    if not text:
+        return None
+
+    cleaned = EMOJI_PATTERN.sub("", text).strip()
+    if not cleaned:
+        return None
+
+    try:
+        tts = gTTS(text=cleaned, lang=TTS_LANGUAGE, tld=TTS_ACCENT_TLD)
+        temp_file = tempfile.NamedTemporaryFile(
+            suffix=".mp3", delete=False, dir=tempfile.gettempdir()
+        )
+        tts.save(temp_file.name)
+        return temp_file.name
+    except (gTTSError, Exception) as error:
+        print(f"Text-to-speech failed: {error}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Gradio chat interface
 # ---------------------------------------------------------------------------
 
-def build_chat_function(model, vectorizer, df, priority_lookup):
-    def chat_fn(message, history):
+def launch_app(model, vectorizer, df, priority_lookup):
+
+    def respond(message, chat_history):
+        if not message or not message.strip():
+            return chat_history, "", ""
         response, _category, _confidence = get_response(
             message, model, vectorizer, df, priority_lookup
         )
-        return response
-    return chat_fn
+        chat_history = chat_history + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": response},
+        ]
+        return chat_history, "", response
 
+    def read_last_reply(last_response):
+        audio_path = synthesize_speech(last_response)
+        if audio_path is None:
+            gr.Warning(
+                "Couldn't generate audio right now. This feature needs an "
+                "internet connection."
+            )
+        return audio_path
 
-def launch_app(model, vectorizer, df, priority_lookup):
-    chat_fn = build_chat_function(model, vectorizer, df, priority_lookup)
-
-    demo = gr.ChatInterface(
-        fn=chat_fn,
-        title=f"🏦 {BOT_NAME}",
-        description=(
+    with gr.Blocks(title=f"🏦 {BOT_NAME}") as demo:
+        gr.Markdown(f"## 🏦 {BOT_NAME}")
+        gr.Markdown(
             "Ask me about accounts, cards, loans, UPI, KYC, net banking, "
             "and other everyday banking topics. I'm an AI assistant trained "
             "on common support questions — I can't access live account data. "
             "For urgent issues like a lost card or suspected fraud, I'll "
             "point you to our 24x7 helpline when I can't fully resolve it."
-        ),
-        textbox=gr.Textbox(
-            placeholder="e.g. How do I check my account balance?",
-            scale=7,
-        ),
-        examples=[
-            "How do I check my account balance?",
-            "My debit card got blocked, what should I do?",
-            "What documents are needed to open an account?",
-            "How can I transfer money using UPI?",
-            "I think someone made a fraudulent transaction on my account",
-        ],
-    )
+        )
+
+        chatbot = gr.Chatbot(height=420, label=None)
+        last_response_state = gr.State("")
+
+        with gr.Row():
+            msg_box = gr.Textbox(
+                placeholder="e.g. How do I check my account balance?",
+                scale=8,
+                show_label=False,
+            )
+            send_btn = gr.Button("Send", scale=1, variant="primary")
+
+        with gr.Row():
+            read_aloud_btn = gr.Button("🔊 Read last reply")
+            audio_output = gr.Audio(
+                autoplay=True, show_label=False, interactive=False
+            )
+
+        gr.Examples(
+            examples=[
+                "How do I check my account balance?",
+                "My debit card got blocked, what should I do?",
+                "What documents are needed to open an account?",
+                "How can I transfer money using UPI?",
+                "I think someone made a fraudulent transaction on my account",
+            ],
+            inputs=msg_box,
+        )
+
+        msg_box.submit(
+            respond, [msg_box, chatbot], [chatbot, msg_box, last_response_state]
+        )
+        send_btn.click(
+            respond, [msg_box, chatbot], [chatbot, msg_box, last_response_state]
+        )
+        read_aloud_btn.click(
+            read_last_reply, [last_response_state], [audio_output]
+        )
+
     demo.launch(share=False)
 
 
