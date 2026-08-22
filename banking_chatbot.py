@@ -301,11 +301,30 @@ def synthesize_speech(text):
 # Gradio chat interface
 # ---------------------------------------------------------------------------
 
+# Refocuses the message box after every send, so the user can keep typing
+# without clicking back into it - Gradio's own DOM update after clearing
+# the textbox value otherwise drops focus.
+FOCUS_INPUT_JS = """
+() => {
+    const el = document.querySelector('#chat_input textarea');
+    if (el) { el.focus(); }
+}
+"""
+
+EXAMPLE_QUESTIONS = [
+    "How do I check my account balance?",
+    "My debit card got blocked, what should I do?",
+    "What documents are needed to open an account?",
+    "How can I transfer money using UPI?",
+    "I think someone made a fraudulent transaction on my account",
+]
+
+
 def launch_app(model, vectorizer, df, priority_lookup):
 
     def respond(message, chat_history):
         if not message or not message.strip():
-            return chat_history, "", ""
+            return chat_history, "", "", gr.update()
         response, _category, _confidence = get_response(
             message, model, vectorizer, df, priority_lookup
         )
@@ -313,7 +332,9 @@ def launch_app(model, vectorizer, df, priority_lookup):
             {"role": "user", "content": message},
             {"role": "assistant", "content": response},
         ]
-        return chat_history, "", response
+        # hide the example-questions block once a real conversation starts,
+        # so it's only ever seen before the first message
+        return chat_history, "", response, gr.update(visible=False)
 
     def read_last_reply(last_response):
         audio_path = synthesize_speech(last_response)
@@ -334,39 +355,47 @@ def launch_app(model, vectorizer, df, priority_lookup):
             "point you to our 24x7 helpline when I can't fully resolve it."
         )
 
+        # created now (so gr.Examples and the input row below can both
+        # reference it) but not displayed until msg_box.render() is called
+        # further down - this lets it visually end up right above the
+        # Send button, below the chat window, while still being wired up
+        # to the example buttons defined above it
+        msg_box = gr.Textbox(
+            placeholder="e.g. How do I check my account balance?",
+            scale=8,
+            show_label=False,
+            elem_id="chat_input",
+            render=False,
+        )
+
+        # Shown immediately, above the fold, with no chat window in the
+        # way - visible only until the first message is sent, then hidden.
+        with gr.Column(visible=True) as examples_block:
+            gr.Examples(examples=EXAMPLE_QUESTIONS, inputs=msg_box, label="Try asking:")
+
+        # Read-aloud controls sit directly above the chat window, not
+        # buried below the input box, so they're the first thing visible
+        # next to whatever the bot just said.
+        with gr.Row():
+            read_aloud_btn = gr.Button("🔊 Read last reply", scale=1)
+            audio_output = gr.Audio(
+                autoplay=True, show_label=False, interactive=False, scale=3
+            )
+
         chatbot = gr.Chatbot(height=420, label=None)
         last_response_state = gr.State("")
 
         with gr.Row():
-            msg_box = gr.Textbox(
-                placeholder="e.g. How do I check my account balance?",
-                scale=8,
-                show_label=False,
-            )
+            msg_box.render()
             send_btn = gr.Button("Send", scale=1, variant="primary")
 
-        with gr.Row():
-            read_aloud_btn = gr.Button("🔊 Read last reply")
-            audio_output = gr.Audio(
-                autoplay=True, show_label=False, interactive=False
-            )
+        submit_outputs = [chatbot, msg_box, last_response_state, examples_block]
 
-        gr.Examples(
-            examples=[
-                "How do I check my account balance?",
-                "My debit card got blocked, what should I do?",
-                "What documents are needed to open an account?",
-                "How can I transfer money using UPI?",
-                "I think someone made a fraudulent transaction on my account",
-            ],
-            inputs=msg_box,
+        msg_box.submit(respond, [msg_box, chatbot], submit_outputs).then(
+            fn=None, js=FOCUS_INPUT_JS
         )
-
-        msg_box.submit(
-            respond, [msg_box, chatbot], [chatbot, msg_box, last_response_state]
-        )
-        send_btn.click(
-            respond, [msg_box, chatbot], [chatbot, msg_box, last_response_state]
+        send_btn.click(respond, [msg_box, chatbot], submit_outputs).then(
+            fn=None, js=FOCUS_INPUT_JS
         )
         read_aloud_btn.click(
             read_last_reply, [last_response_state], [audio_output]
